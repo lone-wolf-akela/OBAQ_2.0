@@ -393,3 +393,104 @@ class FP_linear(InplaceFunction):
         if norm_grad_weight >= 1:
             grad_weight.div_(norm_grad_weight)
         return grad_input, grad_weight, grad_bias, None
+
+
+class BFP_4DMatMul_LeftWeight(InplaceFunction):
+    @staticmethod
+    def forward(ctx, lhs:torch.Tensor, rhs:torch.Tensor, q_params:Q_params=Q_params(), quantize_grad=True):
+        ctx.lhs = lhs
+        ctx.rhs = rhs
+        ctx.q_params = q_params
+        ctx.quantize_grad = quantize_grad
+
+        if q_params.state == 'reg':
+            output = torch.matmul(lhs, rhs)
+            device = output.device
+
+            # batch_size = lhs.shape[0]
+            patch_num = lhs.shape[1]
+            matrix_dim_a = lhs.shape[2]
+            matrix_dim_b = lhs.shape[3]
+            matrix_dim_c = rhs.shape[3]
+            # (a x b) * (b x c) = (a x c)
+            total_computation = patch_num * matrix_dim_a * matrix_dim_b * matrix_dim_c
+            q_params.computations['W'] = total_computation // 32
+            q_params.computations['bA'] = total_computation // 32
+            q_params.C_W = np.sqrt(matrix_dim_c)
+            q_params.C_bA = np.sqrt(matrix_dim_a)
+
+            W_BFPshape = get_BFP_shape(lhs.shape, q_params.block_size['W'])
+            q_params.sensitivity['W'] = torch.zeros(size=W_BFPshape, device=device)
+            bA_BFPshape = get_BFP_shape(rhs.shape, q_params.block_size['bA'])
+            q_params.sensitivity['bA'] = torch.zeros(size=bA_BFPshape, device=device)
+            A_BFPshape = bA_BFPshape
+            q_params.sensitivity['A'] = torch.zeros(size=A_BFPshape, device=device)
+            G_BFPshape = get_BFP_shape(output.shape, q_params.block_size['G'])
+            q_params.sensitivity['G'] = torch.zeros(size=G_BFPshape, device=device)
+
+            return output
+        
+        A_sparsity_counter = q_params.sparsity_counter['A']
+        W_sparsity_counter = q_params.sparsity_counter['W']
+
+        # forward activation(rhs) quantization
+        A_block_size, A_block_bw = q_params.block_size['A'], q_params.int_bwmap['A']
+        forward_q_rhs = BFPQuant(rhs, A_block_size, A_block_bw, sparsity_counter=A_sparsity_counter)
+
+        # forward weight(lhs) quantization
+        W_block_size, W_block_bw = q_params.block_size['W'], q_params.int_bwmap['W']
+        forward_q_lhs = BFPQuant(lhs, W_block_size, W_block_bw, sparsity_counter=W_sparsity_counter)
+        
+        output = torch.matmul(forward_q_lhs, forward_q_rhs)
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output:torch.Tensor):
+        q_params:Q_params = ctx.q_params
+        lhs:torch.Tensor = ctx.lhs
+        rhs:torch.Tensor = ctx.rhs
+
+        G_sparsity_counter = q_params.sparsity_counter['G']
+        bA_sparsity_counter = q_params.sparsity_counter['bA']
+        # print(bA_sparsity_counter.val)
+    
+        # grad activation quantization:
+        if ctx.quantize_grad:
+            G_block_size, G_block_bw = q_params.block_size['G'], q_params.int_bwmap['G']
+            q_grad_output = BFPQuant(grad_output, G_block_size, G_block_bw, True, sparsity_counter=G_sparsity_counter)
+        else:
+            q_grad_output = grad_output
+
+        # backward activation(rhs) quantization
+        bA_block_size, bA_block_bw = q_params.block_size['bA'], q_params.int_bwmap['bA']
+        backward_q_rhs = BFPQuant(rhs, bA_block_size, bA_block_bw, sparsity_counter=bA_sparsity_counter)
+        
+        # backward weight(lhs) quantization
+        W_block_size, W_block_bw = q_params.block_size['W'], q_params.int_bwmap['W']
+        backward_q_lhs = BFPQuant(lhs, W_block_size, W_block_bw)
+
+        # Backward Stage: 
+        # lhs (a x b) * rhs (b x c) = grad_output (a x c)
+        # grad_output (a x c) * rhs.T (c x b) = grad_lhs (a x b)
+        # lhs.T (b x a) * grad_output (a x c) = grad_rhs (b x c)
+
+        # lhs
+        if ctx.needs_input_grad[0]:
+            grad_lhs = torch.matmul(q_grad_output, backward_q_rhs.transpose(-1, -2))
+        else:
+            grad_lhs = None
+
+        # rhs
+        if ctx.needs_input_grad[1]:
+            grad_rhs = torch.matmul(backward_q_lhs.transpose(-1, -2), q_grad_output)
+        else:
+            grad_rhs = None
+        
+        if q_params.state == 'train':
+            W_sensitivity = Sensitivity_Analysis(lhs, grad_lhs, block_size=W_block_size, C=q_params.C_W)
+            q_params.sensitivity['W'] += W_sensitivity
+            bA_sensitivity = Sensitivity_Analysis(rhs, grad_rhs, block_size=bA_block_size, C=q_params.C_bA)
+            q_params.sensitivity['bA'] += bA_sensitivity
+
+        return grad_lhs, grad_rhs, None, None

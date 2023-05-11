@@ -94,11 +94,26 @@ def round(data, scale, stochastic=True, min_value = None, max_value=torch.inf):
     data_quantized = (data / scale).add_(noise).round_().clip_(min_value, max_value).mul_(scale) # 非原位操作, 需要python3.7以上版本
     return data_quantized
 
-def decompose_tensor(x):
+def decompose_tensor(x:torch.Tensor):
+    if x.dtype == torch.float32:
+        mantissa_width = 23
+        exponent_offset = 127
+        view_type = torch.int32
+    elif x.dtype == torch.float16:
+        mantissa_width = 10
+        exponent_offset = 15
+        view_type = torch.int16
+    elif x.dtype == torch.bfloat16:
+        mantissa_width = 7
+        exponent_offset = 127
+        view_type = torch.int16
+    else:
+        raise TypeError(f"Unsupported data type: {x.dtype}")
+
     negative = x < 0
-    n = torch.abs(x).view(torch.int32)
-    exponent = (n >> 23) - 127
-    mantissa = n & torch.tensor(((1 << 23) - 1), dtype=torch.int32)
+    n = torch.abs(x).view(view_type)
+    exponent = (n >> mantissa_width) - exponent_offset
+    mantissa = n & torch.tensor(((1 << mantissa_width) - 1), dtype=view_type)
     return negative, exponent.float(), mantissa
 
 def BFPQuant(data:torch.tensor, block_size:tuple, block_bw:tuple, stochastic=False, sparsity_counter=None):
